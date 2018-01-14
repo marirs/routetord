@@ -1,0 +1,537 @@
+#!/usr/bin/env python
+"""A socket server for routing specific source addresses through Tor
+
+Copyright 2015 Sean Whalen
+Copyright 2015 Jacob Gajek
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+   Modified by Colin Hunt <colin.hunt@live.com> 
+
+   Modified by Marirs <marirs@gmail.com> 
+"""
+from __future__ import print_function
+import argparse
+import atexit
+import errno
+import logging
+import os
+import signal
+import socket
+import sys
+import time
+import traceback
+
+from ConfigParser import RawConfigParser
+from grp import getgrnam
+from os import getuid, path, remove, chown, chmod
+from stat import S_IRUSR, S_IWUSR, S_IWGRP
+from subprocess import call, PIPE
+
+__version__ = "2.0.1"
+
+########################## Inlined Daemon library ##############################
+
+class Daemon(object):
+    """
+    Modified generic daemon class
+
+    Author:         http://www.jejik.com/articles/2007/02/
+                            a_simple_unix_linux_daemon_in_python/www.boxedice.com
+
+    License:        http://creativecommons.org/licenses/by-sa/3.0/
+
+    Changes:        23rd Jan 2009 (David Mytton <david@boxedice.com>)
+                    - Replaced hard coded '/dev/null in __init__ with os.devnull
+                    - Added OS check to conditionally remove code that doesn't
+                      work on OS X
+                    - Added output to console on completion
+                    - Tidied up formatting
+                    11th Mar 2009 (David Mytton <david@boxedice.com>)
+                    - Fixed problem with daemon exiting on Python 2.4
+                      (before SystemExit was part of the Exception base)
+                    13th Aug 2010 (David Mytton <david@boxedice.com>
+                    - Fixed unhandled exception if PID file is empty
+                    24th May 2017 (Colin Hunt <colin.hunt@live.com>)
+                    - Added 'main' utility
+                    - Stopping daemon properly on unhandled exits or exceptions
+
+    Usage: subclass the Daemon class and override the init() and run() methods
+    """
+    def __init__(self, pidfile, stdin=os.devnull,
+                 stdout=os.devnull, stderr=os.devnull,
+                 home_dir='.', umask=0o22, verbose=1,
+                 use_gevent=False, use_eventlet=False):
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+        self.home_dir = home_dir
+        self.verbose = verbose
+        self.umask = umask
+        self.daemon_alive = True
+        self.use_gevent = use_gevent
+        self.use_eventlet = use_eventlet
+
+    def log(self, *args):
+        if self.verbose >= 1:
+            print(*args)
+
+    def daemonize(self):
+        """
+        Do the UNIX double-fork magic, see Stevens' "Advanced
+        Programming in the UNIX Environment" for details (ISBN 0201563177)
+        http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+        """
+        if self.use_eventlet:
+            import eventlet.tpool
+            eventlet.tpool.killall()
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # Exit first parent
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write(
+                "fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # Decouple from parent environment
+        os.chdir(self.home_dir)
+        os.setsid()
+        os.umask(self.umask)
+
+        # Do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # Exit from second parent
+                sys.exit(0)
+        except OSError as e:
+            sys.stderr.write(
+                "fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        if sys.platform != 'darwin':  # This block breaks on OS X
+            # Redirect standard file descriptors
+            sys.stdout.flush()
+            sys.stderr.flush()
+            si = open(self.stdin, 'r')
+            so = open(self.stdout, 'a+')
+            if self.stderr:
+                try:
+                    se = open(self.stderr, 'a+', 0)
+                except ValueError:
+                    # Python 3 can't have unbuffered text I/O
+                    se = open(self.stderr, 'a+', 1)
+            else:
+                se = so
+            os.dup2(si.fileno(), sys.stdin.fileno())
+            os.dup2(so.fileno(), sys.stdout.fileno())
+            os.dup2(se.fileno(), sys.stderr.fileno())
+
+        def sigtermhandler(signum, frame):
+            self.daemon_alive = False
+            sys.exit()
+
+        if self.use_gevent:
+            import gevent
+            gevent.reinit()
+            gevent.signal(signal.SIGTERM, sigtermhandler, signal.SIGTERM, None)
+            gevent.signal(signal.SIGINT, sigtermhandler, signal.SIGINT, None)
+        else:
+            signal.signal(signal.SIGTERM, sigtermhandler)
+            signal.signal(signal.SIGINT, sigtermhandler)
+
+        self.log("Started")
+
+        # Write pidfile
+        atexit.register(
+            self.delpid)  # Make sure pid file is removed if we quit
+        pid = str(os.getpid())
+        open(self.pidfile, 'w+').write("%s\n" % pid)
+
+    def delpid(self):
+        try:
+            # the process may fork itself again
+            pid = int(open(self.pidfile, 'r').read().strip())
+            if pid == os.getpid():
+                os.remove(self.pidfile)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                pass
+            else:
+                raise
+
+    def start(self, *args, **kwargs):
+        """
+        Start the daemon
+        """
+
+        self.log("Starting...")
+
+        # Check for a pidfile to see if the daemon already runs
+        try:
+            pf = open(self.pidfile, 'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+        except SystemExit:
+            pid = None
+
+        if pid:
+            message = "pidfile %s already exists. Is it already running?\n"
+            sys.stderr.write(message % self.pidfile)
+            sys.exit(1)
+
+        try:
+            self.init()
+        except:
+            self.log("Failed to start.")
+            raise
+
+        # Start the daemon
+        self.daemonize()
+        self._run(*args, **kwargs)
+
+    def stop(self):
+        """
+        Stop the daemon
+        """
+
+        if self.verbose >= 1:
+            self.log("Stopping...")
+
+        # Get the pid from the pidfile
+        pid = self.get_pid()
+
+        if not pid:
+            message = "pidfile %s does not exist. Not running?\n"
+            sys.stderr.write(message % self.pidfile)
+
+            # Just to be sure. A ValueError might occur if the PID file is
+            # empty but does actually exist
+            if os.path.exists(self.pidfile):
+                os.remove(self.pidfile)
+
+            return  # Not an error in a restart
+
+        # Try killing the daemon process
+        try:
+            i = 0
+            while 1:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.1)
+                i = i + 1
+                if i % 20 == 0:
+                    os.kill(pid, signal.SIGHUP)
+        except OSError as err:
+            if err.errno == errno.ESRCH:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print(str(err))
+                sys.exit(1)
+
+        self.log("Stopped")
+
+    def restart(self):
+        """
+        Restart the daemon
+        """
+        self.stop()
+        self.start()
+
+    def get_pid(self):
+        try:
+            pf = open(self.pidfile, 'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+        except SystemExit:
+            pid = None
+        return pid
+
+    def is_running(self):
+        pid = self.get_pid()
+
+        if pid is None:
+            self.log('Process is stopped')
+            return False
+        elif os.path.exists('/proc/%d' % pid):
+            self.log('Process (pid %d) is running...' % pid)
+            return True
+        else:
+            self.log('Process (pid %d) is killed' % pid)
+            return False
+
+    def _run(self):
+        try:
+            self.run()
+        except SystemExit as e:
+            self.log('SystemExit received...')
+        except:
+            self.log("Unhandled exception occurred ('%s')" % sys.exc_info()[1])
+            self.log("---\n'%s'\n---" % traceback.format_exc())
+        finally:
+            self.stop()
+
+    def init(self):
+        """
+        You may override this method when you subclass Daemon.
+        It will be called before the process is
+        daemonized by start() or restart().
+        """
+        pass
+
+    def run(self):
+        """
+        You should override this method when you subclass Daemon.
+        It will be called after the process has been
+        daemonized by start() or restart().
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def usage():
+        print("usage: %s start|stop|restart|status" % sys.argv[0])
+        sys.exit(2)
+
+    @staticmethod
+    def main(daemon):
+        if len(sys.argv) >= 2:
+            cmd = sys.argv[1]
+            del sys.argv[1] # so it doesn't interfere with argparse
+            if 'start' == cmd:
+                daemon.start()
+            elif 'stop' == cmd:
+                daemon.stop()
+            elif 'restart' == cmd:
+                daemon.restart()
+            elif 'status' == cmd:
+                daemon.is_running()
+            else:
+                print("Unknown command '%s'" % cmd)
+                Daemon.usage()
+            sys.exit(0)
+        else:
+            Daemon.usage()
+
+
+############################## Routetor code ###################################
+
+IPTABLES_PATH = "/sbin/iptables" 
+SOCKFILE = "/var/run/routetord/routetord.sock"
+PIDFILE = "/var/run/routetord/routetord.pid"
+LOGFILE = "/var/log/routetord"
+
+def rule_exists(rule, table=None):
+    """Checks if the given iptables rule already exists"""
+    cmdline = [IPTABLES_PATH]
+    if table:
+        cmdline += ["-t", table]
+    cmdline += ["-C"] + rule
+    return call(cmdline, stdout=PIPE, stderr=PIPE) == 0
+
+
+def insert_rule(rule, table=None):
+    """Inserts the given iptables rule with a higher priority than existing rules"""
+    if not rule_exists(rule, table=table):
+        cmdline = [IPTABLES_PATH]
+        if table:
+            cmdline += ["-t", table]
+        cmdline += ["-I"] + rule
+        return call(cmdline)
+
+
+def delete_rule(rule, table=None):
+    """Deletes an existing iptables rule"""
+    cmdline = [IPTABLES_PATH]
+    if table:
+        cmdline += ["-t", table]
+    cmdline += ["-D"] + rule
+    return call(cmdline)
+
+
+def start_proxy(args, address):
+    """Starts transparent proxy for a specific source IP address"""
+    msg = "starting transparent proxy for {0}".format(address)
+    logging.info(msg)
+    
+    # Prevent packet leaks (https://lists.torproject.org/pipermail/tor-talk/2014-March/03507.html)
+    insert_rule(["OUTPUT", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"])
+    insert_rule(["OUTPUT", "-m", "state", "--state", "INVALID", "-j", "DROP"])
+
+    # Add DNS route
+    rule = ["PREROUTING", "-s", address, "-p", "udp", "--dport", "53",
+            "-j", "REDIRECT", "--to-ports", str(args.dnsport)]
+    
+    if args.interface:
+        rule += ["-i", args.interface]
+
+    insert_rule(rule, table="nat")
+
+    # Add TCP route -- ignore Cuckoo result server port
+    rule = ["PREROUTING", "-s", address, "-p", "tcp", "--syn", "!", "--dport", str(args.resultport),
+            "-j", "REDIRECT", "--to-ports", str(args.proxyport)]
+
+    if args.interface:
+        rule += ["-i", args.interface]
+
+    insert_rule(rule, table="nat")
+
+    return msg
+
+
+def stop_proxy(args, address):
+    """Stops transparent proxy for a specific source IP address"""
+    msg = "stopping transparent proxy for {0}".format(address)
+    logging.info(msg)
+
+    # Delete DNS route
+    rule = ["PREROUTING", "-s", address, "-p", "udp", "--dport", "53",
+            "-j", "REDIRECT", "--to-ports", str(args.dnsport)]
+
+    if args.interface:
+        rule += ["-i", args.interface]
+
+    delete_rule(rule, table="nat")
+
+    # Delete TCP route
+    rule = ["PREROUTING", "-s", address, "-p", "tcp", "--syn", "!", "--dport", str(args.resultport),
+            "-j", "REDIRECT", "--to-ports", str(args.proxyport)]
+
+    if args.interface:
+        rule += ["-i", args.interface]
+
+    delete_rule(rule, table="nat")
+
+    return msg
+
+
+class RoutetorDaemon(Daemon):
+    def init(self):
+        if getuid() != 0:
+            print("This script must be run as root")
+            exit(1)
+
+        # Parse command-line arguments
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("-l", "--logfile", help="Direct all log output to this file", default="/dev/null")
+        parser.add_argument("-g", "--sockgroup", help="Change owner of Unix socket to this group", default="cuckoo")
+        parser.add_argument("-d", "--dnsport", type=int, help="Tor DNS port", default=5353)
+        parser.add_argument("-p", "--proxyport", type=int, help="Tor proxy port", default=9040)
+        parser.add_argument("-r", "--resultport", type=int, help="Cuckoo result server port", default=2042)
+        parser.add_argument("-i", "--interface", help="Source interface for Tor routed traffic")
+        parser.add_argument("-c", "--configfile", help="Read options from this configuration file")
+        self.args = parser.parse_args()
+
+        # Parse configuration file if specified
+        if self.args.configfile and path.exists(self.args.configfile):
+            config = RawConfigParser()
+            config.read(self.args.configfile)
+
+            for option in ["logfile", "sockgroup", "dnsport", "proxyport", "resultport", "interface"]:
+                if config.has_option("routetor", option):
+                    self.args.__setattr__(option, config.get("routetor", option))
+
+        # Initialize logging engine
+        logging.basicConfig(filename=self.args.logfile, level=logging.INFO, format="%(asctime)s routetor: %(message)s")
+        logging.info("v{0} starting".format(__version__))
+
+        # Create Unix socket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        cleanup()
+
+        try:
+            self.sock.bind(SOCKFILE)
+            chown(SOCKFILE, 0, getgrnam(self.args.sockgroup).gr_gid)
+            chmod(SOCKFILE, S_IRUSR | S_IWUSR | S_IWGRP)
+        except Exception as error:
+            msg = "failed to listen at {0} ({1})".format(SOCKFILE, error)
+            logging.critical(msg)
+            print(msg)
+            exit(1)
+
+    def run(self):
+        atexit.register(logging.info, "exiting")
+        addresses = set()
+        # Main command loop
+        self.sock.listen(1)
+        while True:
+            conn, _ = self.sock.accept()    
+            try:
+                cmd = conn.recv(1024)
+                if cmd.split()[0] == "start":
+                    address = cmd.split()[1]
+                    if address in addresses:
+                        conn.sendall("routetord: Proxy already started on that address.")
+                    else:
+                        msg = start_proxy(self.args, address)
+                        addresses.add(address)
+                        conn.sendall('routetord: ' + msg)
+                    continue
+
+                if cmd.split()[0] == "stop":
+                    address = cmd.split()[1]
+                    if address not in addresses:
+                        conn.sendall("routetord: No proxy started on that address.")
+                    else:
+                        msg = stop_proxy(self.args, address)
+                        addresses.discard(address)
+                        conn.sendall('routetord: ' + msg)
+                    continue
+
+                if cmd.split()[0] == 'list':
+                    conn.sendall("[routetord] Currently proxying:\n"+"\n".join(addresses))
+                    continue
+
+                warn = "unrecognized command ({0})".format(cmd)
+                logging.warning(warn)
+                conn.sendall('routetord: ' + warn)
+            except Exception as error:
+                logging.error(error)
+                conn.sendall('routetord: ' + repr(error))
+            except:
+                cleanup()
+                raise
+            finally:
+                conn.close()
+
+
+def cleanup():
+    if path.exists(SOCKFILE):
+        try:
+            remove(SOCKFILE)
+            logging.warning("removing stale socket at {0}".format(SOCKFILE))
+        except OSError as error:
+            logging.error("failed to remove stale socket at {0} ({1})".format(SOCKFILE, error))
+
+
+if __name__ == "__main__":
+    """
+    main function
+    input: 
+    returns:
+    """  
+    # check if pid/sock file directory exists
+    routetord_path = os.path.dirname(os.path.abspath(PIDFILE))
+    if not os.path.exists(routetord_path):
+        os.makedirs(routetord_path)
+
+    # start the daemon
+    Daemon.main(RoutetorDaemon(pidfile=PIDFILE, stdout=LOGFILE, stderr=LOGFILE))
+
