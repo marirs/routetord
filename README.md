@@ -40,7 +40,7 @@ $ sudo service tor restart
 ```
 Now Install the scripts that Cuckoo will use to enable and disable Tor routing per analysis:
 ```sh
-$ git clone git@git.anlyz.co:anlyz/routetord.git
+$ git clone https://github.com/marirs/routetord.git
 $ cd routetord
 $ sudo cp *tor* /usr/sbin
 ```
